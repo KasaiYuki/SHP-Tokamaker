@@ -16,7 +16,7 @@ streamlit run streamlit_app.py
 ## Using the GUI
 
 1. **Shape the plasma.** Use the sliders to set the target major radius, minor radius, elongation and triangularity.
-2. **Draw the vessel and coils.** Edit the vacuum-vessel outline as a table of (R, Z) points, and edit the positions of the 8 poloidal-field (PF) coils in a second table. A live cross-section updates as you edit, with warnings such as a coil overlapping the vessel or the plasma not fitting inside it.
+2. **Draw the vessel and coils.** Edit the vacuum-vessel outline as a table of (R, Z) points, and edit the positions of the poloidal-field (PF) coils in a second table (add or delete rows to change how many there are). A live cross-section updates as you edit, with warnings such as a coil overlapping the vessel or the plasma not fitting inside it.
 3. **Set the physics.** Choose the toroidal field B0, the plasma current target (MA) and the core pressure target (kPa). Set the shape exponents (alpha, gamma) of the FF' and P' profiles. A live profile plot shows the result.
 4. **Solve.** Press "Solve equilibrium". TokaMaker runs and the app reports whether the solve converged.
 5. **Read the results.** The app shows the flux-surface plot with the target boundary, equilibrium statistics (achieved vs. target shape, q95, beta_pol, l_i and others) with hints on what to change, the PF coil currents against the 2 x Ip limit, and the vertical-stability feedback capability parameter, which should be below 2.

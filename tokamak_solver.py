@@ -36,7 +36,6 @@ VV_ETA = 6.9e-7
 COIL_SIZE = 0.3
 WALL_THICKNESS = 0.04
 N_ISOFLUX, ISOFLUX_WEIGHT = 30, 5.0
-N_COILS = 8
 
 _LABELS = {
     "major_radius": "Major radius", "minor_radius": "Minor radius", "elongation": "Elongation",
@@ -235,8 +234,8 @@ def validate_design(design):
                 warn(f"The target plasma is only {100 * gap:.0f} cm from the vessel wall.")
 
     # --- coils
-    if len(coils) != N_COILS:
-        err(f"All {N_COILS} coils need an R and a Z.")
+    if len(coils) < 1:
+        err("Add at least one PF coil.")
     squares = [_coil_square(c) for c in coils]
     for i, (c, sq) in enumerate(zip(coils, squares)):
         name = f"PF_{i + 1}"

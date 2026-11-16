@@ -24,7 +24,6 @@ from plotly.subplots import make_subplots
 from tokamak_solver import DEFAULT_DESIGN, plasma_boundary, profile_shape, resize_polygon, validate_design
 
 SOLVER = Path(__file__).with_name("tokamak_solver.py")
-COIL_NAMES = [f"PF_{i}" for i in range(1, 9)]
 COIL_SIZE = 0.3  # m, coils are squares (fixed in the notebook)
 WALL = 0.04  # m, vessel wall thickness (fixed in the notebook)
 SCALAR_KEYS = ["major_radius", "minor_radius", "elongation", "triangularity",
@@ -45,7 +44,6 @@ def reset_design():
     s.p_kPa = DEFAULT_DESIGN["p_core_target"] / 1e3
     s.vv_base = pd.DataFrame(DEFAULT_DESIGN["vv_boundary"], columns=["R", "Z"], dtype=float)
     s.coil_base = pd.DataFrame(DEFAULT_DESIGN["coil_locs"], columns=["R", "Z"], dtype=float)
-    s.coil_base.insert(0, "Coil", COIL_NAMES)
     # New editor keys throw away the tables' pending edits so the reset values show.
     s.table_version = s.get("table_version", 0) + 1
 
@@ -69,7 +67,7 @@ def controls():
     s = st.session_state
     sb = st.sidebar
     sb.header("Your tokamak design")
-    sb.button("Reset to notebook defaults", on_click=reset_design, width="stretch")
+    sb.button("Reset to default values", on_click=reset_design, width="stretch")
 
     sb.subheader("1. Plasma shape targets")
     sb.caption("The cross-section you want the plasma to have. TokaMaker will try to match it.")
@@ -94,11 +92,12 @@ def controls():
                            hide_index=True, column_config=number, width="stretch")
 
     sb.subheader("3. Poloidal-field (PF) coils")
-    sb.caption("Eight 30 cm × 30 cm coils whose magnetic fields push and pull the plasma into shape. "
+    sb.caption("30 cm × 30 cm coils whose magnetic fields push and pull the plasma into shape. "
                "TokaMaker picks their currents for you; you choose where they sit. Keep them outside "
-               "the vessel and move them to fix the plasma shape.")
-    coil_df = sb.data_editor(s.coil_base, key=f"coil_table_{s.table_version}", num_rows="fixed",
-                             hide_index=True, disabled=["Coil"], column_config=number, width="stretch")
+               "the vessel and move them to fix the plasma shape. Each row is one coil (row 1 is PF_1): "
+               "add rows at the bottom or delete rows to change how many there are.")
+    coil_df = sb.data_editor(s.coil_base, key=f"coil_table_{s.table_version}", num_rows="dynamic",
+                             hide_index=True, column_config=number, width="stretch")
 
     sb.subheader("4. Field, current and pressure")
     sb.caption("Raising the plasma current lowers q95; raising the core pressure raises β_pol.")
@@ -131,7 +130,7 @@ def flagged_objects(messages):
     for m in messages:
         if m["level"] != "error":
             continue
-        coils = re.findall(r"\bPF_\d\b", m["message"])
+        coils = re.findall(r"\bPF_\d+\b", m["message"])
         if coils:
             flagged.update(coils)
         elif "plasma" in m["message"]:
@@ -169,26 +168,28 @@ def add_wall(fig, vv, bad):
                     hovertemplate="Vessel point %{text}<br>R=%{x:.2f} m, Z=%{y:.2f} m<extra></extra>")
 
 
-def add_coils(fig, coil_df, flagged):
+def add_coils(fig, coil_locs, flagged):
+    """Draw the coils as squares named PF_1, PF_2, ... in table order."""
     h = COIL_SIZE / 2
+    named = [(f"PF_{i + 1}", r, z) for i, (r, z) in enumerate(coil_locs)]
     for bad in (False, True):
-        rows = [r for r in coil_df.dropna().itertuples() if (r.Coil in flagged) == bad]
+        rows = [c for c in named if (c[0] in flagged) == bad]
         if not rows:
             continue
         color = "#d62728" if bad else "#c87533"
         xs, ys = [], []
-        for r in rows:
-            xs += [r.R - h, r.R + h, r.R + h, r.R - h, r.R - h, None]
-            ys += [r.Z - h, r.Z - h, r.Z + h, r.Z + h, r.Z - h, None]
+        for _, r, z in rows:
+            xs += [r - h, r + h, r + h, r - h, r - h, None]
+            ys += [z - h, z - h, z + h, z + h, z - h, None]
         fig.add_scatter(x=xs, y=ys, fill="toself", fillcolor=color, mode="lines", line=dict(color=color),
-                        name="PF coils (overlapping!)" if bad else "PF coils", hoverinfo="skip")
-        fig.add_scatter(x=[r.R for r in rows], y=[r.Z + h for r in rows], mode="text",
-                        text=[r.Coil for r in rows], textposition="top center", showlegend=False,
-                        textfont=dict(color=color), customdata=[r.Z for r in rows],
+                        name="PF coils (problem)" if bad else "PF coils", hoverinfo="skip")
+        fig.add_scatter(x=[r for _, r, _ in rows], y=[z + h for _, _, z in rows], mode="text",
+                        text=[name for name, _, _ in rows], textposition="top center", showlegend=False,
+                        textfont=dict(color=color), customdata=[z for _, _, z in rows],
                         hovertemplate="%{text}<br>R=%{x:.2f} m, Z=%{customdata:.2f} m<extra></extra>")
 
 
-def cross_section(design, coil_df, flagged, lcfs):
+def cross_section(design, flagged, lcfs):
     fig = go.Figure()
     add_wall(fig, np.array(design["vv_boundary"], dtype=float).reshape(-1, 2), "vessel" in flagged)
     shape = (design["major_radius"], 0.0, design["minor_radius"], design["elongation"], design["triangularity"])
@@ -198,13 +199,14 @@ def cross_section(design, coil_df, flagged, lcfs):
                     mode="lines", line=dict(color=color, width=2), name="Target plasma shape", hoverinfo="skip")
     fig.add_scatter(x=targets[:, 0], y=targets[:, 1], mode="markers", marker=dict(color=color, size=5),
                     name="30 shape-target points", hovertemplate="R=%{x:.2f} m, Z=%{y:.2f} m<extra></extra>")
-    add_coils(fig, coil_df, flagged)
+    add_coils(fig, design["coil_locs"], flagged)
     if lcfs:
         edge = closed(lcfs)
         fig.add_scatter(x=edge[:, 0], y=edge[:, 1], mode="lines", line=dict(color="#2ca02c", width=3),
                         name="Solved plasma edge (LCFS)", hoverinfo="skip")
     fig.update_layout(height=640, margin=dict(l=10, r=10, t=40, b=10), xaxis_title="R (m)",
-                      yaxis_title="Z (m)", yaxis=dict(scaleanchor="x", scaleratio=1),
+                      yaxis_title="Z (m)", yaxis=dict(scaleanchor="x", scaleratio=1, fixedrange=True),
+                      xaxis_fixedrange=True, dragmode=False,  # hover only: no zooming or panning
                       legend=dict(orientation="h", yanchor="bottom", y=1.01))
     return fig
 
@@ -216,7 +218,9 @@ def profile_figure(design):
         fig.add_scatter(x=x, y=y, mode="lines", row=1, col=col, showlegend=False,
                         hovertemplate="ψ̂=%{x:.2f}: %{y:.2f}<extra></extra>")
         fig.update_xaxes(title_text="ψ̂ (0 = centre, 1 = edge)", row=1, col=col)
-    fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="relative size")
+    fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="relative size", dragmode=False)
+    fig.update_xaxes(fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
     return fig
 
 
@@ -361,8 +365,9 @@ def show_coils(res):
     fig = go.Figure(go.Bar(x=list(currents), y=amps, marker_color=["#d62728" if a > limit else "#1f77b4" for a in amps],
                            hovertemplate="%{x}: %{y:.2f} MA<extra></extra>"))
     fig.add_hline(y=limit, line_dash="dash", line_color="#d62728", annotation_text=f"limit 2 × Ip = {limit:.2f} MA")
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="|coil current| (MA)")
-    st.plotly_chart(fig, width="stretch")
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="|coil current| (MA)",
+                      dragmode=False, xaxis_fixedrange=True, yaxis_fixedrange=True)
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     over = [name for name, a in zip(currents, amps) if a > limit]
     if over:
         st.warning(f"{', '.join(over)} {'is' if len(over) == 1 else 'are'} above 2 × Ip. Try:\n"
@@ -422,6 +427,8 @@ def show_results(solved, stale):
 
 # ------------------------------------------------------------------ page
 st.set_page_config(page_title="Tokamak Designer", layout="wide")
+# Streamlit leaves a tall blank band above the title; trim it so the cross-section fits on screen.
+st.markdown("<style>.block-container {padding-top: 1.5rem;}</style>", unsafe_allow_html=True)
 if "vv_base" not in st.session_state:
     reset_design()
 vv_df, coil_df = controls()
@@ -435,7 +442,7 @@ st.markdown(
     "Design a tokamak and find its **equilibrium**: the state where the plasma's outward push is exactly "
     "balanced by magnetic forces (the Grad–Shafranov equation, solved by TokaMaker).\n"
     "1. **Shape**: set the target plasma shape in the sidebar.\n"
-    "2. **Build**: draw the vacuum vessel around it and place the 8 coils outside it. The picture updates live.\n"
+    "2. **Build**: choose the points that define the vacuum vessel that surrounds the plasma and place the PF coils outside it. The picture updates live.\n"
     "3. **Physics**: choose the field, plasma current, pressure and profile shapes.\n"
     "4. **Solve and improve**: press *Solve equilibrium*, check the results against your device targets "
     "(shape, q95, β_pol, l_i, coil currents below 2 × Ip, feedback parameter below 2), adjust, and solve again.")
@@ -444,12 +451,13 @@ left, right = st.columns([3, 2])
 with left:
     st.subheader("Cross-section")
     lcfs = None if stale or solved is None else solved["results"].get("lcfs")
-    st.plotly_chart(cross_section(design, coil_df, flagged_objects(messages), lcfs), width="stretch")
+    st.plotly_chart(cross_section(design, flagged_objects(messages), lcfs), width="stretch",
+                    config={"displayModeBar": False})
     st.caption("You are looking at a vertical slice through one side of the torus; the machine's central "
                "axis is at R = 0, off to the left. Red objects have a problem (see the checks on the right).")
 with right:
     st.subheader("Profile shapes")
-    st.plotly_chart(profile_figure(design), width="stretch")
+    st.plotly_chart(profile_figure(design), width="stretch", config={"displayModeBar": False})
     st.subheader("Check and solve")
     for m in messages:
         (st.error if m["level"] == "error" else st.warning)(m["message"])
