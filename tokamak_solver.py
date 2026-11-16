@@ -353,7 +353,7 @@ def _solve(design, outdir, res, stage):
     ax.set_xlabel("R (m)")
     ax.set_ylabel("Z (m)")
     ax.set_aspect("equal")
-    fig.savefig(os.path.join(outdir, "equilibrium.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(os.path.join(outdir, "equilibrium.png"), dpi=300, bbox_inches="tight")
     plt.close(fig)
     res["images"]["equilibrium"] = "equilibrium.png"
     res["ok"] = True

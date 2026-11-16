@@ -440,9 +440,9 @@ messages = validate_design(design)
 solved = st.session_state.get("solved")
 stale = solved is not None and solved["design"] != design
 
-logo, heading = st.columns([1, 12], vertical_alignment="center")
-logo.image(str(LOGO), width=90)
+heading, logo = st.columns([12, 1], vertical_alignment="center")
 heading.title("Tokamaker Demo")
+logo.image(str(LOGO), width=80)
 st.markdown(
     "Design a tokamak and find its **equilibrium**: the state where the plasma's outward push is exactly "
     "balanced by magnetic forces (the Grad–Shafranov equation, solved by TokaMaker).")
