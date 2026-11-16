@@ -311,7 +311,7 @@ def _solve(design, outdir, res, stage):
     stage("setup")
     from OpenFUSIONToolkit import OFT_env
     from OpenFUSIONToolkit.TokaMaker import TokaMaker
-    tk = TokaMaker(OFT_env(nthreads=2))
+    tk = TokaMaker(OFT_env(nthreads=1))
     tk.setup_mesh(mesh_pts, mesh_lc, mesh_reg)
     tk.setup_regions(cond_dict=cond_dict, coil_dict=coil_dict)
     tk.setup(order=2, F0=float(design["B0"]) * R0)
@@ -387,10 +387,11 @@ def run(design, outdir):
     res = {"ok": False, "stage": "validate", "error": None, "err_flag": None, "validation": [],
            "stats": None, "coil_currents": None, "coil_current_limit": None, "stability": None,
            "stability_error": None, "lcfs": None, "target_boundary": [], "images": {}, "log": "",
-           "elapsed_s": 0.0}
+           "elapsed_s": 0.0, "timings": []}
 
     def stage(name):
         res["stage"] = name
+        res["timings"].append([name, round(time.time() - t0, 2)])  # seconds since start when stage began
         with open(os.path.join(outdir, "progress.txt"), "w") as f:
             f.write(name + "\n")
 
@@ -431,6 +432,8 @@ def run(design, outdir):
             tail = f.read()[-6000:]
         res["log"] = (res["log"] + "\n--- solver output (tail) ---\n" + tail).strip()
     res["elapsed_s"] = round(time.time() - t0, 3)
+    res["log"] += "\n--- stage start times (s) ---\n" + ", ".join(f"{n} {t}" for n, t in res["timings"]) \
+        + f", finished {res['elapsed_s']}"
     with open(os.path.join(outdir, "results.json"), "w") as f:
         json.dump(res, f, indent=1)
     return res
