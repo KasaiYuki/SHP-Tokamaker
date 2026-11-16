@@ -454,11 +454,9 @@ with right:
     for m in messages:
         (st.error if m["level"] == "error" else st.warning)(m["message"])
     has_errors = any(m["level"] == "error" for m in messages)
-    if not messages:
-        st.success("Design checks passed. Ready to solve.")
     if st.button("Solve equilibrium", type="primary", disabled=has_errors, width="stretch",
                  help="Fix the errors above first." if has_errors else "Takes a few seconds."):
-        with st.spinner("TokaMaker is solving for the equilibrium. This takes a few seconds (longer if classmates are solving too)..."):
+        with st.spinner("TokaMaker is solving for the equilibrium. This takes a few seconds..."):
             with solve_slots():
                 st.session_state.solved = run_solver(design)
         st.rerun()

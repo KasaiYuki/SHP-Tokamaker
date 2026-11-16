@@ -191,36 +191,32 @@ def validate_design(design):
         coils = np.array(design["coil_locs"], dtype=float).reshape(-1, 2)
         assert np.all(np.isfinite(vv)) and np.all(np.isfinite(coils))
     except Exception:
-        err("The vacuum vessel points or coil locations are not a list of (R, Z) number pairs.")
+        err("The vessel points or coil locations are not (R, Z) number pairs.")
         return out
 
     # --- vacuum vessel
     vv_ok = False
     if len(vv) < 3:
-        err(f"The vacuum vessel needs at least 3 points (it has {len(vv)}).")
+        err("The vessel needs at least 3 points.")
     else:
         n = len(vv)
         dupes = [(i, j) for i in range(n) for j in range(i + 1, n) if np.linalg.norm(vv[i] - vv[j]) < 0.01]
         for i, j in dupes:
-            err(f"Vacuum vessel points {i + 1} and {j + 1} are on top of each other "
-                f"(R={vv[i, 0]:.2f}, Z={vv[i, 1]:.2f}) - delete one of them.")
+            err(f"Vessel points {i + 1} and {j + 1} are in the same place.")
         crossings = [] if dupes else _self_intersections(vv)
         for i, j in crossings:
-            err(f"The vacuum vessel wall crosses itself: the side from point {i + 1} to {i + 2} hits the side "
-                f"from point {j + 1} to {(j + 1) % n + 1}. Reorder the points so the outline goes around once.")
+            err(f"The vessel outline crosses itself (side {i + 1}-{i + 2} hits side {j + 1}-{(j + 1) % n + 1}).")
         if np.any(vv[:, 0] <= 0):
-            err("Every vacuum vessel point must have R greater than 0.")
+            err("Every vessel point needs R > 0.")
         elif not dupes and not crossings:
             outer = resize_polygon(_ccw(vv), WALL_THICKNESS)
             bad = np.where(~np.all(np.isfinite(outer), axis=1))[0]
             if len(bad):
                 for k in bad:
                     r, z = _ccw(vv)[k]
-                    err(f"The vacuum vessel point at R={r:.2f}, Z={z:.2f} lies on a straight line with its "
-                        f"neighbours (or doubles back) - delete it.")
+                    err(f"The vessel point at R={r:.2f}, Z={z:.2f} is not a corner (it is in line with its neighbours).")
             elif _self_intersections(outer) or _edges_cross(outer, vv):
-                err("The vacuum vessel has a corner that is too sharp or a gap that is too narrow for the "
-                    "4 cm thick wall - smooth out the shape.")
+                err("The vessel has a corner too sharp, or a gap too narrow, for its 4 cm wall.")
             else:
                 vv_ok = True
 
@@ -230,31 +226,28 @@ def validate_design(design):
         bpts = plasma_boundary(N_ISOFLUX, p["major_radius"], 0.0, p["minor_radius"], p["elongation"], p["triangularity"])
         outside = [pt for pt in bpts if not _point_in_poly(pt, vv)]
         if outside:
-            err(f"The target plasma shape pokes outside the vacuum vessel (e.g. at R={outside[0][0]:.2f}, "
-                f"Z={outside[0][1]:.2f}) - make the plasma smaller or the vessel bigger.")
+            err("The target plasma does not fit inside the vessel.")
         elif _edges_cross(bpts, vv):
-            err("The target plasma shape crosses the vacuum vessel wall - make the plasma smaller or the vessel bigger.")
+            err("The target plasma does not fit inside the vessel.")
         else:
             gap = min(_dist_to_poly(pt, vv) for pt in bpts)
             if gap < 0.05:
-                warn(f"The plasma edge comes within {100 * gap:.0f} cm of the vessel wall - "
-                     "the solver may struggle; consider leaving more room.")
+                warn(f"The target plasma is only {100 * gap:.0f} cm from the vessel wall.")
 
     # --- coils
     if len(coils) != N_COILS:
-        err(f"The design must have exactly {N_COILS} coils (it has {len(coils)}).")
+        err(f"All {N_COILS} coils need an R and a Z.")
     squares = [_coil_square(c) for c in coils]
     for i, (c, sq) in enumerate(zip(coils, squares)):
         name = f"PF_{i + 1}"
         if sq[:, 0].min() <= 0:
-            err(f"Coil {name} reaches R <= 0 (through the machine's centre line) - move it to R > {COIL_SIZE / 2:.2f} m.")
+            err(f"Coil {name} must have R > {COIL_SIZE / 2:.2f} m.")
         if vv_ok and _polys_overlap(sq, outer):
-            where = "is inside the vacuum vessel" if _point_in_poly(c, vv) else "overlaps the vacuum vessel wall"
-            err(f"Coil {name} {where} - move it outside the vessel.")
+            where = "is inside the vessel" if _point_in_poly(c, vv) else "overlaps the vessel wall"
+            err(f"Coil {name} {where}.")
         for j in range(i + 1, len(coils)):
             if np.all(np.abs(coils[i] - coils[j]) < COIL_SIZE + 1e-6):
-                err(f"Coils {name} and PF_{j + 1} overlap each other - move them apart "
-                    f"(coils are {COIL_SIZE:.1f} m x {COIL_SIZE:.1f} m squares).")
+                err(f"Coils {name} and PF_{j + 1} overlap.")
     return out
 
 
