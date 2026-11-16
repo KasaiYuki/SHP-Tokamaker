@@ -1,4 +1,4 @@
-"""Tokamak Designer: a no-code version of the MAIN_AOE_tokamaker notebook.
+"""Tokamaker Demo: a no-code version of the MAIN_AOE_tokamaker notebook.
 
 Students set the same quantities they would type into the notebook, watch their machine
 update live, and press "Solve equilibrium" to run TokaMaker. Each solve runs
@@ -24,6 +24,7 @@ from plotly.subplots import make_subplots
 from tokamak_solver import DEFAULT_DESIGN, plasma_boundary, profile_shape, resize_polygon, validate_design
 
 SOLVER = Path(__file__).with_name("tokamak_solver.py")
+LOGO = Path(__file__).with_name("tokamaker_logo.png")
 COIL_SIZE = 0.3  # m, coils are squares (fixed in the notebook)
 WALL = 0.04  # m, vessel wall thickness (fixed in the notebook)
 SCALAR_KEYS = ["major_radius", "minor_radius", "elongation", "triangularity",
@@ -204,7 +205,7 @@ def cross_section(design, flagged, lcfs):
         edge = closed(lcfs)
         fig.add_scatter(x=edge[:, 0], y=edge[:, 1], mode="lines", line=dict(color="#2ca02c", width=3),
                         name="Solved plasma edge (LCFS)", hoverinfo="skip")
-    fig.update_layout(height=640, margin=dict(l=10, r=10, t=40, b=10), xaxis_title="R (m)",
+    fig.update_layout(height=520, margin=dict(l=10, r=10, t=40, b=10), xaxis_title="R (m)",
                       yaxis_title="Z (m)", yaxis=dict(scaleanchor="x", scaleratio=1, fixedrange=True),
                       xaxis_fixedrange=True, dragmode=False,  # hover only: no zooming or panning
                       legend=dict(orientation="h", yanchor="bottom", y=1.01))
@@ -426,9 +427,11 @@ def show_results(solved, stale):
 
 
 # ------------------------------------------------------------------ page
-st.set_page_config(page_title="Tokamak Designer", layout="wide")
-# Streamlit leaves a tall blank band above the title; trim it so the cross-section fits on screen.
-st.markdown("<style>.block-container {padding-top: 1.5rem;}</style>", unsafe_allow_html=True)
+st.set_page_config(page_title="Tokamaker Demo", layout="wide")
+# Streamlit leaves a tall blank band above the title; trim it so the cross-section fits on screen,
+# and lift the sidebar so its heading lines up with the page title.
+st.markdown("<style>.block-container {padding-top: 1.5rem;}"
+            '[data-testid="stSidebarUserContent"] {margin-top: -1.2rem;}</style>', unsafe_allow_html=True)
 if "vv_base" not in st.session_state:
     reset_design()
 vv_df, coil_df = controls()
@@ -437,15 +440,19 @@ messages = validate_design(design)
 solved = st.session_state.get("solved")
 stale = solved is not None and solved["design"] != design
 
-st.title("Tokamak Designer")
+logo, heading = st.columns([1, 12], vertical_alignment="center")
+logo.image(str(LOGO), width=90)
+heading.title("Tokamaker Demo")
 st.markdown(
     "Design a tokamak and find its **equilibrium**: the state where the plasma's outward push is exactly "
-    "balanced by magnetic forces (the Grad–Shafranov equation, solved by TokaMaker).\n"
-    "1. **Shape**: set the target plasma shape in the sidebar.\n"
-    "2. **Build**: choose the points that define the vacuum vessel that surrounds the plasma and place the PF coils outside it. The picture updates live.\n"
-    "3. **Physics**: choose the field, plasma current, pressure and profile shapes.\n"
-    "4. **Solve and improve**: press *Solve equilibrium*, check the results against your device targets "
-    "(shape, q95, β_pol, l_i, coil currents below 2 × Ip, feedback parameter below 2), adjust, and solve again.")
+    "balanced by magnetic forces (the Grad–Shafranov equation, solved by TokaMaker).")
+with st.expander("How to use this page"):
+    st.markdown(
+        "1. **Shape**: set the target plasma shape in the sidebar.\n"
+        "2. **Build**: choose the points that define the vacuum vessel that surrounds the plasma and place the PF coils outside it. The picture updates live.\n"
+        "3. **Physics**: choose the field, plasma current, pressure and profile shapes.\n"
+        "4. **Solve and improve**: press *Solve equilibrium*, check the results against your device targets "
+        "(shape, q95, β_pol, l_i, coil currents below 2 × Ip, feedback parameter below 2), adjust, and solve again.")
 
 left, right = st.columns([3, 2])
 with left:
