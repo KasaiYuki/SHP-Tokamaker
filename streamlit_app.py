@@ -1,797 +1,467 @@
-# 12.2
+"""Tokamak Designer: a no-code version of the MAIN_AOE_tokamaker notebook.
 
-import streamlit as st
-import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import sys
-import os
+Students set the same quantities they would type into the notebook, watch their machine
+update live, and press "Solve equilibrium" to run TokaMaker. Each solve runs
+tokamak_solver.py in its own process, so OpenFUSIONToolkit is never imported here.
+
+Run with:  streamlit run streamlit_app.py
+"""
 import json
-from datetime import datetime
-import glob
-import random
-import base64
-import shutil 
+import re
+import shutil
 import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
 
-st.set_page_config(
-    page_title="Custom Tokamak - Vacuum Vessel Design",
-    layout="wide"
-)
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
 
-# Accessing OpenFUSIONToolkit 
-home_dir = os.path.expanduser("~")
-oft_root_path = os.path.join(home_dir, "OpenFUSIONToolkit/install_release")
-os.environ["OFT_ROOTPATH"] = oft_root_path
-tokamaker_python_path = os.getenv("OFT_ROOTPATH")
-if tokamaker_python_path is not None:
-    sys.path.append(os.path.join(tokamaker_python_path, "python"))
+from tokamak_solver import DEFAULT_DESIGN, plasma_boundary, profile_shape, resize_polygon, validate_design
 
-from OpenFUSIONToolkit.TokaMaker.util import create_isoflux
-
-# Local implementation of resize_polygon function (copied from AOE_tokamaker)
-def resize_polygon(points, dx):
-    new_points = np.empty(np.shape(points))
-    for i in range(np.shape(points)[0]):
-        if i==0:
-            last = points[-1,:]
-            next = points[i+1,:]
-        elif i == np.shape(points)[0]-1:
-            last = points[-2,:]
-            next = points[0,:]
-        else:
-            last = points[i-1,:]
-            next = points[i+1,:]
-        vec = next - last
-        vec_norm = np.linalg.norm(vec)
-        vec_unit = vec / vec_norm
-        vec_dx = vec_unit * dx
-        new_points[i,:] = last + vec_dx
-    return new_points
-
-# Function to check if point is inside polygon using ray casting
-def point_in_polygon(point, polygon):
-    x, y = point
-    n = len(polygon)
-    inside = False
-    p1x, p1y = polygon[0]
-    for i in range(1, n + 1):
-        p2x, p2y = polygon[i % n]
-        if y > min(p1y, p2y):
-            if y <= max(p1y, p2y):
-                if x <= max(p1x, p2x):
-                    if p1y != p2y:
-                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
-                    if p1x == p2x or x <= xinters:
-                        inside = not inside
-        p1x, p1y = p2x, p2y
-    return inside
-
-# Function to validate coil positions
-def validate_coil_positions(coil_coords, vv_coords, plasma_boundary, safety_margin=0.5):
-    validated_coords = []
-    vv_array = np.array(vv_coords)
-    
-    for coil in coil_coords:
-        r, z = coil
-        
-        # Check if coil is inside vacuum vessel
-        if point_in_polygon([r, z], vv_coords):
-            # Move coil outside vacuum vessel
-            # Find the closest point on VV boundary and move outward
-            distances = np.sqrt((vv_array[:, 0] - r)**2 + (vv_array[:, 1] - z)**2)
-            closest_idx = np.argmin(distances)
-            closest_vv_point = vv_array[closest_idx]
-            
-            # Vector from closest VV point to coil
-            direction = np.array([r - closest_vv_point[0], z - closest_vv_point[1]])
-            if np.linalg.norm(direction) > 0:
-                direction = direction / np.linalg.norm(direction)
-            else:
-                direction = np.array([1, 0])  # Default direction
-            
-            # Move coil outside VV with safety margin
-            new_r = closest_vv_point[0] + direction[0] * safety_margin
-            new_z = closest_vv_point[1] + direction[1] * safety_margin
-            validated_coords.append([new_r, new_z])
-        else:
-            validated_coords.append([r, z])
-    
-    return validated_coords
-
-def clear_results():
-    if 'analysis_completed' in st.session_state:
-        del st.session_state.analysis_completed
-    if 'output_folder' in st.session_state:
-        del st.session_state.output_folder
-    if 'locked_design' in st.session_state:
-        del st.session_state.locked_design
-    if 'design_file' in st.session_state:
-        del st.session_state.design_file
-
-    # Clear files
-    files = glob.glob('examples/testing_1/*')
-    for f in files:
-        if os.path.isfile(f):
-            os.remove(f)
-        elif os.path.isdir(f):
-            shutil.rmtree(f)
-    
-    # Force a complete page reload by clearing more session state
-    st.cache_data.clear()
-
-# Initialize session state
-if 'vv_coords' not in st.session_state:
-    st.session_state.vv_coords = [
-        [3.25, -0.75], [3.75, -1.25], [4.5, -1.85], [6.0, -1.85], 
-        [6.0, 1.85], [4.5, 1.85], [3.75, 1.25], [3.25, 1.0]
-    ]
-
-if 'coil_coords' not in st.session_state:
-    # Updated coil positions to be outside the vacuum vessel
-    st.session_state.coil_coords = [
-        [4.0, 2.5], [4.0, -2.5], [5.25, 2.25], [5.25, -2.25],
-        [6.5, 0.5], [6.5, -0.5], [2.8, 0.25], [2.8, -0.25]
-    ]
-
-if 'editing_point' not in st.session_state:
-    st.session_state.editing_point = None
-
-if 'original_coords' not in st.session_state:
-    st.session_state.original_coords = None
-
-st.title("Custom Tokamak - Vacuum Vessel Design")
-col1, col2 = st.columns([1, 4])
-
-with col1:
-    st.header("Plasma Parameters")
-    
-    major_radius = st.slider("Major Radius (m)", 3.0, 6.0, 4.55, 0.05)
-    minor_radius = st.slider("Minor Radius (m)", 0.8, 2.0, 1.2, 0.05)
-    elongation = st.slider("Elongation", 1.0, 2.0, 1.4, 0.05)
-    triangularity = st.slider("Triangularity", -0.8, 0.8, -0.5, 0.05)
-    
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        if st.button("Add VV Point", key="add_vv"):
-
-            point_1 = random.choice(st.session_state.vv_coords)
-            # Find the index of point_1 in the list
-            point_1_index = st.session_state.vv_coords.index(point_1)
-            # Create array without point_1
-            remaining_coords = [coord for i, coord in enumerate(st.session_state.vv_coords) if i != point_1_index]
-            point_2 = random.choice(remaining_coords)
-
-            avg_r = (point_1[0] + point_2[0]) / 2
-            avg_z = (point_1[1] + point_2[1]) / 2
-
-            st.session_state.vv_coords.append([avg_r, avg_z])
-            st.rerun()
-        
-        # if st.button("Add Coil", key="add_coil"):
-        #     if len(st.session_state.coil_coords) < 8:
-
-        #         point_1 = random.choice(st.session_state.coil_coords)
-        #         point_1_index = st.session_state.coil_coords.index(point_1)
-        #         remaining_coords = [coord for i, coord in enumerate(st.session_state.coil_coords) if i != point_1_index]
-        #         point_2 = random.choice(remaining_coords)
-
-        #         avg_r = (point_1[0] + point_2[0]) / 2
-        #         avg_z = (point_1[1] + point_2[1]) / 2
-
-        #         st.session_state.coil_coords.append([avg_r,avg_z])
-        #         st.rerun()
-        #     else: 
-        #         st.warning("You can only have 8 coils maximum")
-        
-    
-    with col_b:
-        if st.button("Delete VV Point", key="del_vv"): 
-            if len(st.session_state.vv_coords) > 4:
-                st.session_state.vv_coords.pop()
-            else:
-                st.warning("You can only have 4 VV points minimum")
-            st.rerun()
+SOLVER = Path(__file__).with_name("tokamak_solver.py")
+COIL_NAMES = [f"PF_{i}" for i in range(1, 9)]
+COIL_SIZE = 0.3  # m, coils are squares (fixed in the notebook)
+WALL = 0.04  # m, vessel wall thickness (fixed in the notebook)
+SCALAR_KEYS = ["major_radius", "minor_radius", "elongation", "triangularity",
+               "B0", "ffp_alpha", "ffp_gamma", "pp_alpha", "pp_gamma"]
+STAGES = {"start": "start-up", "validate": "design check", "mesh": "mesh building", "setup": "solver setup",
+          "solve": "equilibrium solve", "stats": "statistics", "stability": "vertical-stability check",
+          "done": "final step"}
+OK, WARN, INFO = ":green[:material/check_circle:]", ":orange[:material/warning:]", ":blue[:material/info:]"
 
 
-        # if st.button("Delete Last Coil", key="del_coil"): 
-        #     if len(st.session_state.coil_coords) > 4:
-        #         st.session_state.coil_coords.pop()
-        #     else:
-        #         st.warning("You can only have 4 coils minimum")
-        #     st.rerun()
-        
+# ------------------------------------------------------------------ design state
+def reset_design():
+    """Put every control back to the notebook's values (also used to initialise the app)."""
+    s = st.session_state
+    for key in SCALAR_KEYS:
+        s[key] = float(DEFAULT_DESIGN[key])
+    s.Ip_MA = DEFAULT_DESIGN["Ip_target"] / 1e6
+    s.p_kPa = DEFAULT_DESIGN["p_core_target"] / 1e3
+    s.vv_base = pd.DataFrame(DEFAULT_DESIGN["vv_boundary"], columns=["R", "Z"], dtype=float)
+    s.coil_base = pd.DataFrame(DEFAULT_DESIGN["coil_locs"], columns=["R", "Z"], dtype=float)
+    s.coil_base.insert(0, "Coil", COIL_NAMES)
+    # New editor keys throw away the tables' pending edits so the reset values show.
+    s.table_version = s.get("table_version", 0) + 1
 
-    # Advanced Settings Section
-    st.subheader("Advanced Settings")
-    
-    # Initialize session state for advanced settings visibility
-    if 'show_advanced' not in st.session_state:
-        st.session_state.show_advanced = False
-    
-    # Toggle button for advanced settings
-    if st.button("⚙️ Show Advanced Parameters" if not st.session_state.show_advanced else "⚙️ Hide Advanced Parameters"):
-        st.session_state.show_advanced = not st.session_state.show_advanced
-        st.rerun()
-    
-    # Show advanced parameters if toggled on
-    if st.session_state.show_advanced:
-        st.markdown("**Magnetic Field & Current Parameters**")
-        
-        B0 = st.number_input("B0 (Toroidal Magnetic Field)", value=11.0, format="%.2f")
-        Ip_target = st.number_input("Ip_target", value=8E6, format="%.0f")
-        Ip_ratio_target = st.number_input("Ip_ratio_target", value=0.333, format="%.3f")
-        ffp_alpha = st.number_input("ffp_alpha", value=2.15, format="%.2f")
-        ffp_gamma = st.number_input("ffp_gamma", value=1.7, format="%.2f")
-        pp_alpha = st.number_input("pp_alpha", value=2.15, format="%.2f")
-        pp_gamma = st.number_input("pp_gamma", value=1.7, format="%.2f")
+
+def points(df):
+    """(R, Z) rows of an edited table as a list of float pairs, skipping rows with blank cells."""
+    return df[["R", "Z"]].dropna().astype(float).values.tolist()
+
+
+def read_design(vv_df, coil_df):
+    s = st.session_state
+    design = {key: s[key] for key in SCALAR_KEYS}
+    design.update(Ip_target=s.Ip_MA * 1e6, p_core_target=s.p_kPa * 1e3,
+                  vv_boundary=points(vv_df), coil_locs=points(coil_df))
+    return design
+
+
+# ------------------------------------------------------------------ sidebar controls
+def controls():
+    """Draw every design control in the sidebar; return the edited vessel and coil tables."""
+    s = st.session_state
+    sb = st.sidebar
+    sb.header("Your tokamak design")
+    sb.button("Reset to notebook defaults", on_click=reset_design, width="stretch")
+
+    sb.subheader("1. Plasma shape targets")
+    sb.caption("The cross-section you want the plasma to have. TokaMaker will try to match it.")
+    sb.slider("Major radius R (m)", 0.5, 8.0, step=0.05, key="major_radius",
+              help="Distance from the machine's central axis to the centre of the plasma.")
+    sb.slider("Minor radius a (m)", 0.2, 2.5, step=0.05, key="minor_radius",
+              help="Half the width of the plasma.")
+    sb.slider("Elongation κ", 1.0, 2.5, step=0.05, key="elongation",
+              help="Height ÷ width. 1 is a circle; bigger stretches the plasma vertically.")
+    sb.slider("Triangularity δ", -0.8, 0.8, step=0.05, key="triangularity",
+              help="Positive: top and bottom tips lean toward the central axis (a 'D' shape). "
+                   "Negative: they lean outward.")
+
+    sb.subheader("2. Vacuum vessel")
+    sb.caption("The airtight steel chamber around the plasma, drawn with a 4 cm wall. Each row is a "
+               "corner (R, Z); corners are joined **in table order** and the last joins back to the "
+               "first (row 1 is point 1 in the picture). Add rows at the bottom or delete rows to "
+               "change the outline. A wall close to the plasma helps hold it still vertically.")
+    number = {"R": st.column_config.NumberColumn("R (m)", format="%.2f", step=0.01, min_value=0.0),
+              "Z": st.column_config.NumberColumn("Z (m)", format="%.2f", step=0.01)}
+    vv_df = sb.data_editor(s.vv_base, key=f"vv_table_{s.table_version}", num_rows="dynamic",
+                           hide_index=True, column_config=number, width="stretch")
+
+    sb.subheader("3. Poloidal-field (PF) coils")
+    sb.caption("Eight 30 cm × 30 cm coils whose magnetic fields push and pull the plasma into shape. "
+               "TokaMaker picks their currents for you; you choose where they sit. Keep them outside "
+               "the vessel and move them to fix the plasma shape.")
+    coil_df = sb.data_editor(s.coil_base, key=f"coil_table_{s.table_version}", num_rows="fixed",
+                             hide_index=True, disabled=["Coil"], column_config=number, width="stretch")
+
+    sb.subheader("4. Field, current and pressure")
+    sb.caption("Raising the plasma current lowers q95; raising the core pressure raises β_pol.")
+    sb.slider("Toroidal field B0 (T)", 0.5, 13.0, step=0.1, key="B0",
+              help="Strength of the main magnetic field that runs the long way around the torus, "
+                   "measured at the major radius R.")
+    sb.slider("Plasma current target Ip (MA)", 0.1, 20.0, step=0.1, key="Ip_MA",
+              help="Current flowing through the plasma itself. Its magnetic field wraps around the "
+                   "plasma and squeezes it (1 MA = one million amps).")
+    sb.number_input("Core pressure target (kPa)", 1.0, 5000.0, step=5.0, format="%.1f", key="p_kPa",
+                    help="Pressure at the plasma's centre (1 atmosphere ≈ 101 kPa). Hotter or denser "
+                         "plasma means higher pressure.")
+
+    sb.subheader("5. Profile shapes")
+    sb.caption("How current (FF′) and pressure (P′) are spread from the plasma's centre (ψ̂ = 0) to "
+               "its edge (ψ̂ = 1). Each follows $(1-\\hat\\psi^{\\alpha})^{\\gamma}$. A smaller α or a larger γ piles more "
+               "current near the centre (a 'peaked' profile), which raises l_i.")
+    for name, what in (("ffp", "FF′ (current)"), ("pp", "P′ (pressure)")):
+        sb.slider(f"{what} α", 0.5, 6.0, step=0.05, key=f"{name}_alpha",
+                  help="Smaller α: the profile drops off sooner, so it is more peaked at the centre.")
+        sb.slider(f"{what} γ", 0.5, 6.0, step=0.05, key=f"{name}_gamma",
+                  help="Larger γ: the profile falls faster toward the edge, so it is more peaked.")
+    return vv_df, coil_df
+
+
+# ------------------------------------------------------------------ live plots
+def flagged_objects(messages):
+    """Which drawn objects an error message is about: coil names, 'plasma' or 'vessel'."""
+    flagged = set()
+    for m in messages:
+        if m["level"] != "error":
+            continue
+        coils = re.findall(r"\bPF_\d\b", m["message"])
+        if coils:
+            flagged.update(coils)
+        elif "plasma" in m["message"]:
+            flagged.add("plasma")
+        elif "vessel" in m["message"]:
+            flagged.add("vessel")
+    return flagged
+
+
+def closed(poly):
+    poly = np.asarray(poly, dtype=float)
+    return np.vstack([poly, poly[:1]])
+
+
+def add_wall(fig, vv, bad):
+    """Draw the vessel as the solver builds it: the outline plus a 4 cm wall offset outward."""
+    color = "#d62728" if bad else "#555555"
+    if len(vv) < 3:
+        return
+    signed_area = np.sum(vv[:, 0] * np.roll(vv[:, 1], -1) - np.roll(vv[:, 0], -1) * vv[:, 1])
+    inner = vv if signed_area > 0 else vv[::-1]  # resize_polygon offsets outward for counter-clockwise points
+    outer = resize_polygon(inner, WALL)
+    if np.all(np.isfinite(outer)):
+        # One "keyhole" path (outer loop, then inner loop backwards) fills just the wall, not the inside.
+        wall = np.vstack([closed(outer), inner[:1], inner[:0:-1], inner[:1]])
+        fig.add_scatter(x=wall[:, 0], y=wall[:, 1], fill="toself", fillcolor=color, mode="lines",
+                        line=dict(color=color, width=1), name="Vacuum vessel wall", hoverinfo="skip")
     else:
-        # Set default values when advanced settings are hidden
-        B0 = 11.0
-        Ip_target = 8E6
-        Ip_ratio_target = 0.333
-        ffp_alpha = 2.15
-        ffp_gamma = 1.7
-        pp_alpha = 2.15
-        pp_gamma = 1.7
+        ring = closed(vv)
+        fig.add_scatter(x=ring[:, 0], y=ring[:, 1], mode="lines", line=dict(color=color, width=3),
+                        name="Vacuum vessel wall", hoverinfo="skip")
+    fig.add_scatter(x=vv[:, 0], y=vv[:, 1], mode="markers+text", text=[str(i + 1) for i in range(len(vv))],
+                    marker=dict(size=17, color="white", line=dict(color=color, width=2)),
+                    textfont=dict(size=10, color="black"), name="Vessel points (table rows)",
+                    hovertemplate="Vessel point %{text}<br>R=%{x:.2f} m, Z=%{y:.2f} m<extra></extra>")
 
-with col2:
-    st.header("Vacuum Vessel Design")
-    
-    # Generate plasma boundary
-    boundary_pts = create_isoflux(30, major_radius, 0.0, minor_radius, elongation, triangularity)
-    
-    # Create vacuum vessel arrays
-    vv_boundary = np.array(st.session_state.vv_coords)
-    vv_outer = resize_polygon(vv_boundary, 0.04)    
-    
-    # Create Plotly figure
+
+def add_coils(fig, coil_df, flagged):
+    h = COIL_SIZE / 2
+    for bad in (False, True):
+        rows = [r for r in coil_df.dropna().itertuples() if (r.Coil in flagged) == bad]
+        if not rows:
+            continue
+        color = "#d62728" if bad else "#c87533"
+        xs, ys = [], []
+        for r in rows:
+            xs += [r.R - h, r.R + h, r.R + h, r.R - h, r.R - h, None]
+            ys += [r.Z - h, r.Z - h, r.Z + h, r.Z + h, r.Z - h, None]
+        fig.add_scatter(x=xs, y=ys, fill="toself", fillcolor=color, mode="lines", line=dict(color=color),
+                        name="PF coils (overlapping!)" if bad else "PF coils", hoverinfo="skip")
+        fig.add_scatter(x=[r.R for r in rows], y=[r.Z + h for r in rows], mode="text",
+                        text=[r.Coil for r in rows], textposition="top center", showlegend=False,
+                        textfont=dict(color=color), customdata=[r.Z for r in rows],
+                        hovertemplate="%{text}<br>R=%{x:.2f} m, Z=%{customdata:.2f} m<extra></extra>")
+
+
+def cross_section(design, coil_df, flagged, lcfs):
     fig = go.Figure()
-    
-    # Add vacuum vessel outer boundary (filled)
-    fig.add_trace(go.Scatter(
-        x=np.append(vv_outer[:, 0], vv_outer[0, 0]),  # Close the polygon
-        y=np.append(vv_outer[:, 1], vv_outer[0, 1]),
-        fill='toself',
-        fillcolor='rgba(25,31,52,1.0)',
-        line=dict(color='black', width=2),
-        mode='lines',
-        name='VV Outer',
-        hoverinfo='skip'
-    ))
-    
-    # Add vacuum vessel inner boundary (filled white)
-    fig.add_trace(go.Scatter(
-        x=np.append(vv_boundary[:, 0], vv_boundary[0, 0]),  # Close the polygon
-        y=np.append(vv_boundary[:, 1], vv_boundary[0, 1]),
-        fill='toself',
-        fillcolor='white',
-        line=dict(color='black', width=2),
-        mode='lines',
-        name='VV Inner',
-        hoverinfo='skip'
-    ))
-    
-    # Add plasma boundary (filled blue)
-    fig.add_trace(go.Scatter(
-        x=np.append(boundary_pts[:, 0], boundary_pts[0, 0]),  # Close the polygon
-        y=np.append(boundary_pts[:, 1], boundary_pts[0, 1]),
-        fill='toself',
-        fillcolor='rgba(0,100,255,0.3)',
-        line=dict(color='blue', width=2),
-        mode='lines',
-        name='Plasma',
-        hoverinfo='skip'
-    ))
-    
-    # clickable vacuum vessel points
-    fig.add_trace(go.Scatter(
-        x=[coord[0] for coord in st.session_state.vv_coords],
-        y=[coord[1] for coord in st.session_state.vv_coords],
-        mode='markers',
-        marker=dict(
-            size=15,
-            color='orange',
-            symbol='circle',
-            line=dict(width=3, color='black')
-        ),
-        name='VV Points',
-        customdata=['vv'] * len(st.session_state.vv_coords),
-        hovertemplate='VV Point %{pointIndex}<br>R: %{x:.2f}<br>Z: %{y:.2f}<br>Click to edit<extra></extra>'
-    ))
-    
-    # clickable coil points
-    if len(st.session_state.coil_coords) > 0:
-        coil_colors = []
-        coil_names = []
-        
-        for i, (r, z) in enumerate(st.session_state.coil_coords):
-            # Check if coil is properly positioned
-            is_inside_vv = point_in_polygon([r, z], st.session_state.vv_coords)
-            is_inside_plasma = point_in_polygon([r, z], boundary_pts.tolist())
-            
-            if is_inside_vv or is_inside_plasma:
-                coil_colors.append('red')
-                coil_names.append(f'Coil {i+1} (INVALID)')
-            else:
-                coil_colors.append('darkred')
-                coil_names.append(f'Coil {i+1}')
-        
-        fig.add_trace(go.Scatter(
-            x=[coord[0] for coord in st.session_state.coil_coords],
-            y=[coord[1] for coord in st.session_state.coil_coords],
-            mode='markers',
-            marker=dict(
-                size=18,
-                color=coil_colors,
-                symbol='circle',
-                line=dict(width=3, color='black')
-            ),
-            name='Coils',
-            customdata=['coil'] * len(st.session_state.coil_coords),
-            hovertemplate='%{text}<br>R: %{x:.2f}<br>Z: %{y:.2f}<br>Click to edit<extra></extra>',
-            text=coil_names
-        ))
-    
-    # Configure layout
-    fig.update_layout(
-        width=800,
-        height=750,
-        xaxis_title="R (m)",
-        yaxis_title="Z (m)",
-        xaxis=dict(scaleanchor="y", scaleratio=1),
-        yaxis=dict(scaleanchor="x", scaleratio=1),
-        showlegend=True,
-        dragmode='pan',
-        hovermode='closest',
-        clickmode='event+select'
-    )
-    
-    # Display the plot and capture click events
-    event = st.plotly_chart(fig, use_container_width=True, key="main_plot", on_select="rerun")
-    
-    # Add helpful legend instruction
-    st.caption("💡 **Tip:** Click on any legend item (VV Outer, VV Inner, Plasma, VV Points, Coils) to show/hide that component")
-    
-    # Handle clicking on dots
-    if event and 'selection' in event:
-        
-        if event['selection']['points']:
-            point = event['selection']['points'][0]
-            
-            # Use the correct field names from the actual event structure
-            curve_number = point.get('curve_number', -1)  # Changed from 'curveNumber'
-            point_index = point.get('point_index', -1)    # Changed from 'pointIndex'
-            
-            # Try to set editing point for ANY curve/point combination
-            if curve_number == 3:  # VV points
-                st.session_state.editing_point = ('vv', point_index)
-                # Store original coordinates for cancel functionality
-                st.session_state.original_coords = st.session_state.vv_coords[point_index].copy()
-                # Removed st.rerun() - let the natural flow continue to sliders
-            elif curve_number == 4:  # Coil points
-                st.session_state.editing_point = ('coil', point_index)
-                # Store original coordinates for cancel functionality
-                st.session_state.original_coords = st.session_state.coil_coords[point_index].copy()
-                # Removed st.rerun() - let the natural flow continue to sliders
-            else:
-                st.write(f"❌ Unknown curve: {curve_number}")
-    
-    # Show editing interface with sliders if a point is selected
-    if st.session_state.editing_point:
-        
-        point_type, idx = st.session_state.editing_point
-        
-        if point_type == 'vv':
-            
-            # Get current coordinates
-            current_r = st.session_state.vv_coords[idx][0]
-            current_z = st.session_state.vv_coords[idx][1]
-            
-            st.write(f"**Editing VV Point {idx + 1}**")
-            if st.session_state.original_coords:
-                st.caption(f"Original position: R={st.session_state.original_coords[0]:.2f}, Z={st.session_state.original_coords[1]:.2f}")
-            
-            # Create sliders with appropriate ranges
-            col_slider_r, col_slider_z = st.columns(2)
-            
-            with col_slider_r:
-                new_r = st.slider(
-                    f"R Position (m)", 
-                    min_value=0.5,
-                    max_value=8.0, 
-                    value=current_r, 
-                    step=0.1,
-                    key=f"slider_vv_r_{idx}"
-                )
-            
-            with col_slider_z:
-                new_z = st.slider(
-                    f"Z Position (m)", 
-                    min_value=-3.0, 
-                    max_value=3.0, 
-                    value=current_z, 
-                    step=0.1,
-                    key=f"slider_vv_z_{idx}"
-                )
-            
-            # Control buttons
-            col_done, col_cancel = st.columns(2)
-            with col_done:
-                if st.button("✓ Done Editing", key=f"done_vv_{idx}"):
-                    # Apply the slider values to the coordinates
-                    st.session_state.vv_coords[idx] = [new_r, new_z]
-                    st.session_state.editing_point = None
-                    st.session_state.original_coords = None
-                    st.rerun()
-            with col_cancel:
-                if st.button("✗ Cancel", key=f"cancel_vv_{idx}"):
-                    # Restore original coordinates
-                    if st.session_state.original_coords is not None:
-                        st.session_state.vv_coords[idx] = st.session_state.original_coords.copy()
-                    st.session_state.editing_point = None
-                    st.session_state.original_coords = None
-                    st.rerun()
-        
-        elif point_type == 'coil':
-            st.write(f"**Editing Coil {idx + 1}**")
-            if st.session_state.original_coords:
-                st.caption(f"Original position: R={st.session_state.original_coords[0]:.2f}, Z={st.session_state.original_coords[1]:.2f}")
-            
-            # Get current coordinates
-            current_r = st.session_state.coil_coords[idx][0]
-            current_z = st.session_state.coil_coords[idx][1]
-            
-            # Create sliders with appropriate ranges
-            col_slider_r, col_slider_z = st.columns(2)
-            
-            with col_slider_r:
-                new_r = st.slider(
-                    f"R Position (m)", 
-                    min_value=1.0, 
-                    max_value=8.0, 
-                    value=current_r, 
-                    step=0.05,
-                    key=f"slider_coil_r_{idx}"
-                )
-            
-            with col_slider_z:
-                new_z = st.slider(
-                    f"Z Position (m)", 
-                    min_value=-4.0, 
-                    max_value=4.0, 
-                    value=current_z, 
-                    step=0.05,
-                    key=f"slider_coil_z_{idx}"
-                )
-            
-            # Show validation status for preview (using slider values)
-            is_inside_vv = point_in_polygon([new_r, new_z], st.session_state.vv_coords)
-            is_inside_plasma = point_in_polygon([new_r, new_z], boundary_pts.tolist())
-            
-            if is_inside_vv or is_inside_plasma:
-                st.warning("⚠️ **Preview**: Coil would be inside vacuum vessel or plasma!")
-            else:
-                st.success("✅ **Preview**: Coil would be properly positioned outside.")
-            
-            # Control buttons
-            col_done, col_cancel = st.columns(2)
-            with col_done:
-                if st.button("✓ Done Editing", key=f"done_coil_{idx}"):
-                    # Apply the slider values to the coordinates
-                    st.session_state.coil_coords[idx] = [new_r, new_z]
-                    st.session_state.editing_point = None
-                    st.session_state.original_coords = None
-                    st.rerun()
-            with col_cancel:
-                if st.button("✗ Cancel", key=f"cancel_coil_{idx}"):
-                    # Restore original coordinates
-                    if st.session_state.original_coords is not None:
-                        st.session_state.coil_coords[idx] = st.session_state.original_coords.copy()
-                    st.session_state.editing_point = None
-                    st.session_state.original_coords = None
-                    st.rerun()
-    
+    add_wall(fig, np.array(design["vv_boundary"], dtype=float).reshape(-1, 2), "vessel" in flagged)
+    shape = (design["major_radius"], 0.0, design["minor_radius"], design["elongation"], design["triangularity"])
+    color = "#d62728" if "plasma" in flagged else "#1f77b4"
+    smooth, targets = closed(plasma_boundary(200, *shape)), plasma_boundary(30, *shape)
+    fig.add_scatter(x=smooth[:, 0], y=smooth[:, 1], fill="toself", fillcolor="rgba(31,119,180,0.15)",
+                    mode="lines", line=dict(color=color, width=2), name="Target plasma shape", hoverinfo="skip")
+    fig.add_scatter(x=targets[:, 0], y=targets[:, 1], mode="markers", marker=dict(color=color, size=5),
+                    name="30 shape-target points", hovertemplate="R=%{x:.2f} m, Z=%{y:.2f} m<extra></extra>")
+    add_coils(fig, coil_df, flagged)
+    if lcfs:
+        edge = closed(lcfs)
+        fig.add_scatter(x=edge[:, 0], y=edge[:, 1], mode="lines", line=dict(color="#2ca02c", width=3),
+                        name="Solved plasma edge (LCFS)", hoverinfo="skip")
+    fig.update_layout(height=640, margin=dict(l=10, r=10, t=40, b=10), xaxis_title="R (m)",
+                      yaxis_title="Z (m)", yaxis=dict(scaleanchor="x", scaleratio=1),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.01))
+    return fig
 
-# Add reset button at the bottom
-st.markdown("---")
 
-# Add reset button at the bottom
-col_reset1, col_reset2, col_reset3 = st.columns(3)
-with col_reset1:
-    if st.button("🔄 Reset Vacuum Vessel"):
-        st.session_state.vv_coords = [
-            [3.25, -0.75], [3.75, -1.25], [4.5, -1.85], [6.0, -1.85], 
-            [6.0, 1.85], [4.5, 1.85], [3.75, 1.25], [3.25, 1.0]
-        ]
-        st.session_state.editing_point = None
-        st.rerun()
+def profile_figure(design):
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("FF′ (current)", "P′ (pressure)"), shared_yaxes=True)
+    for col, name in ((1, "ffp"), (2, "pp")):
+        x, y = profile_shape(design[f"{name}_alpha"], design[f"{name}_gamma"])
+        fig.add_scatter(x=x, y=y, mode="lines", row=1, col=col, showlegend=False,
+                        hovertemplate="ψ̂=%{x:.2f}: %{y:.2f}<extra></extra>")
+        fig.update_xaxes(title_text="ψ̂ (0 = centre, 1 = edge)", row=1, col=col)
+    fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="relative size")
+    return fig
 
-with col_reset2:
-    if st.button("🔄 Reset Coils"):
-        st.session_state.coil_coords = [
-            [4.0, 2.5], [4.0, -2.5], [5.25, 2.25], [5.25, -2.25],
-            [6.5, 0.5], [6.5, -0.5], [2.8, 0.25], [2.8, -0.25]
-        ]
-        st.session_state.editing_point = None
-        st.rerun()
 
-with col_reset3:
-    if st.button("🔄 Reset All"):
-        st.session_state.vv_coords = [
-            [3.25, -0.75], [3.75, -1.25], [4.5, -1.85], [6.0, -1.85], 
-            [6.0, 1.85], [4.5, 1.85], [3.75, 1.25], [3.25, 1.0]
-        ]
-        st.session_state.coil_coords = [
-            [4.0, 2.5], [4.0, -2.5], [5.25, 2.25], [5.25, -2.25],
-            [6.5, 0.5], [6.5, -0.5], [2.8, 0.25], [2.8, -0.25]
-        ]
-        st.session_state.editing_point = None
-        st.rerun()
-    
-# Add reset button at the bottom
-st.markdown("---")
+# ------------------------------------------------------------------ solving
+@st.cache_resource
+def solve_slots():
+    """Shared by every visitor: at most 2 solves run at once (each needs ~250 MB), the rest wait their turn."""
+    return threading.Semaphore(2)
 
-# Add Lock Design button before reset buttons
-st.header("🔒 Lock Design & Generate Analysis")
-col_lock, col_run, col_status = st.columns([1, 1, 2])
 
-with col_lock:
-    if st.button("🔒 Lock Design", type="primary", help="Save current design and prepare for analysis"):
-        # Create design data structure
-        clear_results()
+def run_solver(design):
+    """Run tokamak_solver.py on `design` in a throwaway folder; return everything the results need."""
+    workdir = Path(tempfile.mkdtemp(prefix="tokamak_"))
+    try:
+        design_file = workdir / "design.json"
+        design_file.write_text(json.dumps(design))
+        try:
+            proc = subprocess.run([sys.executable, str(SOLVER), str(design_file), str(workdir)],
+                                  capture_output=True, text=True, timeout=600)
+            stderr = proc.stderr
+        except subprocess.TimeoutExpired:
+            stderr = "The solver was stopped after 10 minutes."
+        if (workdir / "results.json").exists():
+            res = json.loads((workdir / "results.json").read_text())
+        else:  # the Fortran library crashed hard before results.json could be written
+            progress = workdir / "progress.txt"
+            stages = progress.read_text().split() if progress.exists() else []
+            log = workdir / "solver.log"
+            res = {"ok": False, "stage": stages[-1] if stages else "start", "crashed": True,
+                   "error": "The solver program crashed without finishing.",
+                   "log": log.read_text(errors="replace")[-6000:] if log.exists() else ""}
+        names = res.get("images") or {"mesh": "mesh.png", "equilibrium": "equilibrium.png"}
+        images = {k: (workdir / v).read_bytes() for k, v in names.items() if (workdir / v).exists()}
+        return {"results": res, "images": images, "stderr": stderr[-4000:], "design": design}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
-        design_data = {
-            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
-            "plasma_parameters": {
-                "major_radius": major_radius,
-                "minor_radius": minor_radius,
-                "elongation": elongation,
-                "triangularity": triangularity
-            },
-            "advanced_settings": {
-                "B0": B0,
-                "Ip_target": Ip_target,
-                "Ip_ratio_target": Ip_ratio_target,
-                "ffp_alpha": ffp_alpha,
-                "ffp_gamma": ffp_gamma,
-                "pp_alpha": pp_alpha,
-                "pp_gamma": pp_gamma
-            },
-            "vacuum_vessel": {
-                "boundary_coordinates": st.session_state.vv_coords
-            },
-            "coil_coordinates": st.session_state.coil_coords,
-            "validation": {
-                "valid_coils": [],
-                "invalid_coils": []
-            }
-        }
-        
-        # Validate coil positions
-        boundary_pts = create_isoflux(30, major_radius, 0.0, minor_radius, elongation, triangularity)
-        for i, (r, z) in enumerate(st.session_state.coil_coords):
-            is_inside_vv = point_in_polygon([r, z], st.session_state.vv_coords)
-            is_inside_plasma = point_in_polygon([r, z], boundary_pts.tolist())
-            
-            if is_inside_vv or is_inside_plasma:
-                design_data["validation"]["invalid_coils"].append(i)
-            else:
-                design_data["validation"]["valid_coils"].append(i)
-        
-        # Save to JSON file
-        examples_dir = "examples"
-        testing_dir = os.path.join(examples_dir, "testing_1")
 
-        # Create directories if they don't exist
-        os.makedirs(testing_dir, exist_ok=True)
+# ------------------------------------------------------------------ results
+def fmt(value, digits=2, scale=1.0):
+    return "—" if value is None else f"{value * scale:.{digits}f}"
 
-        design_file = f"design_{design_data['timestamp']}.json"
-        design_file_path = os.path.join(testing_dir, design_file)
-    
-        with open(design_file_path, 'w') as f:
-            json.dump(design_data, f, indent=2)
-        
-        # Store in session state for status display
-        st.session_state.locked_design = design_data
-        st.session_state.design_file = design_file_path
-        
-        st.success(f"✅ Design locked and saved to: {design_file_path}")
-        st.rerun()
-                                                 
 
-with col_run:
-    if 'locked_design' in st.session_state:
-        if st.button("🚀 Run Analysis", type="secondary", help="Execute AOE_tokamaker with current design"):
-            with st.spinner("Running AOE_tokamaker analysis..."):
-                try:
-                    # Get the current working directory and construct the path to tokamak_psp_2025
-                    current_dir = os.getcwd()
-                    
-                    # Check if we're already in the tokamak_psp_2025 directory
-                    if os.path.basename(current_dir) == "tokamak_psp_2025":
-                        # We're already in the tokamak directory
-                        tokamak_dir = current_dir
-                    else:
-                        # We're in the parent directory, so join with tokamak_psp_2025
-                        tokamak_dir = os.path.join(current_dir, "tokamak_psp_2025")
-                    
-                    # Verify the directory exists and contains the notebook
-                    notebook_path = os.path.join(tokamak_dir, "AOE_tokamaker.ipynb")
-                    if not os.path.exists(notebook_path):
-                        st.error(f"❌ AOE_tokamaker.ipynb not found at: {notebook_path}")
-                        st.error(f"Current working directory: {current_dir}")
-                        st.error(f"Tokamak directory: {tokamak_dir}")
-                        st.stop()
-                    
-                    # Run the AOE_tokamaker script
-                    result = subprocess.run([
-                        "jupyter", 
-                        "nbconvert",
-                        "--execute",
-                        "--to",
-                        "notebook",
-                        "--inplace",
-                        "AOE_tokamaker.ipynb",
-                    ], cwd=tokamak_dir, capture_output=True, text=True)
-                
-                    if result.returncode == 0:
-                        st.success("✅ Analysis completed successfully!")
-                        st.session_state.analysis_completed = True
-                        st.session_state.output_folder = "tokamak_psp_2025/examples/testing_1"
-                        st.rerun()
-                    else:
-                        st.error("❌ Analysis failed. Check console for errors.")
-                        st.error(result.stderr)
-                        
-                except Exception as e:
-                    st.error(f"❌ Error running analysis: {e}")
+def show_convergence(solved):
+    res = solved["results"]
+    if res.get("ok"):
+        st.success(f"Converged: TokaMaker found an equilibrium (error flag 0) in {res.get('elapsed_s', 0):.1f} s.")
+        return
+    stage = STAGES.get(res.get("stage"), res.get("stage"))
+    flag = f" (error flag {res['err_flag']})" if res.get("err_flag") is not None else ""
+    st.error(f"No equilibrium: the solve stopped during the **{stage}** step{flag}.  \n{res.get('error') or ''}")
+    st.markdown("**Things to try:**\n"
+                "- Leave more room between the target plasma and the vessel wall.\n"
+                "- Move the PF coils closer to the plasma, and spread them around it so each has a job.\n"
+                "- Ask for less: a smaller elongation κ or triangularity |δ|, or a lower Ip or core pressure.")
+    if res.get("crashed"):
+        with st.expander("Crash details (for your teacher)"):
+            st.caption("Error output of the solver program (its full output is in the solver log below).")
+            st.code(solved["stderr"].strip() or "(no error output)")
+
+
+def show_equilibrium(images):
+    if "equilibrium" in images:
+        st.image(images["equilibrium"], width=520,
+                 caption="Coloured lines are flux surfaces inside the plasma (surfaces the field lines stay "
+                         "on); dashed grey lines are the field outside it. Red crosses are your target "
+                         "boundary: if the plasma edge misses them, move the coils.")
+    if "mesh" in images:
+        with st.expander("Computational mesh"):
+            st.image(images["mesh"], width=480,
+                     caption="TokaMaker splits the machine into small triangles and solves on them.")
+
+
+def checklist(stats, design):
+    """The notebook's six things to check (cell 48), each with an icon and a rule-of-thumb hint."""
+    def shape(name, target, got, tol, pct):
+        if got is None:
+            return INFO, f"**{name}**: not available."
+        off = abs(got - target) > tol
+        within = f"±{pct}" if pct else f"±{tol:.2f}"
+        return (WARN if off else OK), f"**{name}** {got:.2f} vs target {target:.2f} ({within}). " + (
+            "Too far off: move the PF coils to pull the plasma toward the target shape." if off else "Close enough.")
+
+    centroid = (stats.get("Ip_centroid") or [None])[0]
+    items = [shape("Current centroid R (m)", design["major_radius"], centroid, 0.03 * design["major_radius"], "3 %"),
+             shape("Elongation κ", design["elongation"], stats.get("kappa"), 0.05 * design["elongation"], "5 %"),
+             shape("Triangularity δ", design["triangularity"], stats.get("delta"), 0.05, None)]
+    q95 = stats.get("q_95")
+    if q95 is None:
+        items.append((INFO, "**q95**: not available."))
+    elif q95 < 2.5:
+        items.append((WARN, f"**q95** = {q95:.2f} is below 2.5, which risks disruptions. Lower Ip to raise it."))
+    elif q95 > 4:
+        items.append((WARN, f"**q95** = {q95:.2f} is well above 4. You could raise Ip to bring it down."))
     else:
-        st.info("💡 Lock design first to enable analysis")
+        items.append((OK, f"**q95** = {q95:.2f} is in the usual 2.5–4 range."))
+    items.append((INFO, f"**β_pol** = {fmt(stats.get('beta_pol'))} %. Compare with your target: if too low, "
+                        "raise the core pressure; if too high, lower it."))
+    items.append((INFO, f"**l_i** = {fmt(stats.get('l_i'))}. Compare with your target: to raise it, make the "
+                        "profiles more peaked (smaller α or larger γ); to lower it, make them flatter."))
+    return items
 
-with col_status:
-    if 'locked_design' in st.session_state:
-        design = st.session_state.locked_design
-        st.write("**🔒 Current Locked Design:**")
-        st.write(f"• Timestamp: {design['timestamp']}")
-        st.write(f"• Major Radius: {design['plasma_parameters']['major_radius']:.2f} m")
-        st.write(f"• Minor Radius: {design['plasma_parameters']['minor_radius']:.2f} m")
-        st.write(f"• Elongation: {design['plasma_parameters']['elongation']:.1f}")
-        st.write(f"• Triangularity: {design['plasma_parameters']['triangularity']:.1f}")
-        st.write(f"• Valid Coils: {len(design['validation']['valid_coils'])}/8")
-        
-        if design['validation']['invalid_coils']:
-            st.warning(f"⚠️ Invalid coil positions: {design['validation']['invalid_coils']}")
-        else:
-            st.success("✅ All coils positioned correctly")
-    else:
-        st.info("💡 Lock your design to save parameters and proceed with analysis")
 
-# Display analysis results if available
-if 'analysis_completed' in st.session_state and st.session_state.analysis_completed:
-    st.markdown("---")
-    st.header("📊 Analysis Results")
-    
-    # Get the current working directory and construct the proper path to output folder
-    current_dir = os.getcwd()
-    
-    # Check if we're already in the tokamak_psp_2025 directory
-    if os.path.basename(current_dir) == "tokamak_psp_2025":
-        # We're already in the tokamak directory
-        output_folder = os.path.join(current_dir, "examples", "testing_1")
-    else:
-        # We're in the parent directory, so join with tokamak_psp_2025
-        output_folder = os.path.join(current_dir, "tokamak_psp_2025", "examples", "testing_1")
-    
-    if os.path.exists(output_folder):
-        # Look for specific numbered files in order
-        image_files = []
-        gif_files = []
-        
-        # Define the specific order for images
-        ordered_filenames = [
-            "01_vacuum_vessel_design.png",
-            "02_plasma_profiles.png", 
-            "03_initial_equilibrium.png",
-            "04_coil_currents.png",
-            "05_growth_rate_vs_beta_p.png",
-            "06_mode_structures_different_beta_p.png",
-            "07_nonlinear_plasma_evolution.png",
-            "09_vde_evolution.gif"
-        ]
-        
-        # Check which files exist and organize them
-        existing_images = {}
-        existing_gifs = []
-        
-        for filename in ordered_filenames:
-            file_path = os.path.join(output_folder, filename)
-            if os.path.exists(file_path):
-                if filename.lower().endswith('.gif'):
-                    existing_gifs.append(file_path)
-                else:
-                    # Extract the number prefix for organization
-                    file_number = filename.split('_')[0]
-                    existing_images[file_number] = file_path
-        
-        if existing_images or existing_gifs:            
-            # Display images in 2 columns with specific organization
-            # Column 1: 01, 03, 05
-            # Column 2: 02, 04, 06, 07
-            col1, col2 = st.columns(2)
-            
-            # Column 1 images (01, 03, 05)
-            column1_numbers = ["01", "03", "05"]
-            with col1:
-                for num in column1_numbers:
-                    if num in existing_images:
-                        try:
-                            filename = os.path.basename(existing_images[num])
-                            from PIL import Image
-                            img = Image.open(existing_images[num])
-                            st.image(img, caption=filename, use_container_width=True)
-                        except Exception as e:
-                            st.error(f"Error loading {existing_images[num]}: {e}")
-            
-            # Column 2 images (02, 04, 06, 07)
-            column2_numbers = ["02", "04", "06", "07"]
-            with col2:
-                for num in column2_numbers:
-                    if num in existing_images:
-                        try:
-                            filename = os.path.basename(existing_images[num])
-                            from PIL import Image
-                            img = Image.open(existing_images[num])
-                            st.image(img, caption=filename, use_container_width=True)
-                        except Exception as e:
-                            st.error(f"Error loading {existing_images[num]}: {e}")
-            
-            # Display GIF files below the columns (09)
-            if existing_gifs:
-                st.markdown("<br>", unsafe_allow_html=True)
-                
-                for gif_path in existing_gifs:
-                    try:
-                        filename = os.path.basename(gif_path)
-                        
-                        # Use base64 encoding for proper GIF display
-                        with open(gif_path, "rb") as gif_file:
-                            contents = gif_file.read()
-                            data_url = base64.b64encode(contents).decode("utf-8")
-                        
-                        # Display GIF using HTML with base64 encoding - full width
-                        st.markdown(
-                            f'<img src="data:image/gif;base64,{data_url}" alt="{filename}" style="width: 95%; max-width: 95%;">',
-                            unsafe_allow_html=True,
-                        )
-                        
-                        # Add caption below (matches st.image caption style)
-                        st.caption(filename)
-                        
-                    except Exception as e:
-                        st.error(f"Error loading {gif_path}: {e}")
+def show_stats(res, design):
+    stats = res["stats"]
+    centroid = (stats.get("Ip_centroid") or [None])[0]
+    rows = [("Major radius R (m), current centroid", fmt(design["major_radius"]), fmt(centroid)),
+            ("Major radius R (m), geometric centre", fmt(design["major_radius"]), fmt(stats.get("R_geo"))),
+            ("Minor radius a (m)", fmt(design["minor_radius"]), fmt(stats.get("a_geo"))),
+            ("Elongation κ", fmt(design["elongation"]), fmt(stats.get("kappa"))),
+            ("Triangularity δ", fmt(design["triangularity"]), fmt(stats.get("delta"))),
+            ("Plasma current Ip (MA)", fmt(design["Ip_target"], scale=1e-6), fmt(stats.get("Ip"), scale=1e-6)),
+            ("Core pressure (kPa)", fmt(design["p_core_target"], 1, 1e-3), fmt(stats.get("P_ax"), 1, 1e-3)),
+            ("q95, safety factor near the edge", "2.5–4", fmt(stats.get("q_95"))),
+            ("q0, safety factor at the centre", "", fmt(stats.get("q_0"))),
+            ("β_pol, poloidal beta (%)", "your target", fmt(stats.get("beta_pol"))),
+            ("β_tor, toroidal beta (%)", "", fmt(stats.get("beta_tor"))),
+            ("β_N, normalized beta", "", fmt(stats.get("beta_n"))),
+            ("l_i, internal inductance", "your target", fmt(stats.get("l_i")))]
+    left, right = st.columns([1, 1])
+    left.dataframe(pd.DataFrame(rows, columns=["Quantity", "Target", "Achieved"]), hide_index=True,
+                   width="stretch", height=35 * len(rows) + 38)
+    with right:
+        st.markdown("**Checklist**")
+        for icon, text in checklist(stats, design):
+            st.markdown(f"{icon} {text}")
+    with st.expander("What do these numbers mean?"):
+        st.markdown(
+            "- **q (safety factor)**: how many times a magnetic field line goes the long way around the "
+            "torus for each trip the short way around. Too low (q95 < 2.5) and the plasma tends to disrupt.\n"
+            "- **β (beta)**: plasma pressure divided by magnetic pressure: how hard the magnet is working. "
+            "β_pol compares with the field made by the plasma current; β_tor with the toroidal field B0; "
+            "β_N = β_tor (%) × a (m) × B0 (T) ÷ Ip (MA) is a 'how close to the limit' number (about 3–4).\n"
+            "- **l_i (internal inductance)**: how concentrated the current is near the centre. Peaked "
+            "profiles give a higher l_i.")
 
-        else:
-            st.warning(f"No result files found in the output folder: {output_folder}")
-            # Debug information
-            st.write("**Debug info:**")
-            st.write(f"- Current working directory: {current_dir}")
-            st.write(f"- Looking for images in: {output_folder}")
-            st.write(f"- Folder exists: {os.path.exists(output_folder)}")
-            if os.path.exists(output_folder):
-                all_files = os.listdir(output_folder)
-                st.write(f"- Files in folder: {all_files}")
+
+def show_coils(res):
+    currents = res["coil_currents"]
+    limit = (res.get("coil_current_limit") or 2 * res["stats"]["Ip"]) / 1e6
+    amps = [abs(v) / 1e6 for v in currents.values()]
+    fig = go.Figure(go.Bar(x=list(currents), y=amps, marker_color=["#d62728" if a > limit else "#1f77b4" for a in amps],
+                           hovertemplate="%{x}: %{y:.2f} MA<extra></extra>"))
+    fig.add_hline(y=limit, line_dash="dash", line_color="#d62728", annotation_text=f"limit 2 × Ip = {limit:.2f} MA")
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="|coil current| (MA)")
+    st.plotly_chart(fig, width="stretch")
+    over = [name for name, a in zip(currents, amps) if a > limit]
+    if over:
+        st.warning(f"{', '.join(over)} {'is' if len(over) == 1 else 'are'} above 2 × Ip. Try:\n"
+                   "- moving those coils closer to the plasma (you may need to reshape the vessel);\n"
+                   "- moving coils apart from one another, so they don't have to fight each other.")
     else:
-        st.error(f"Output folder not found: {output_folder}")
-        # Debug information
-        st.write("**Debug info:**")
-        st.write(f"- Current working directory: {current_dir}")
-        st.write(f"- Expected output folder: {output_folder}")
-    
-    # Add button to clear results
-    if st.button("🗑️ Clear Results"):
-        clear_results()
+        st.success("Every coil current is below 2 × Ip.")
+
+
+def show_stability(res):
+    stab = res.get("stability")
+    if not stab:
+        st.info(f"The vertical-stability check could not be completed, but the equilibrium above is still "
+                f"valid. {res.get('stability_error') or ''}")
+        return
+    value = stab.get("feedback_capability")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Feedback capability parameter", fmt(value))
+    c2.metric("Growth rate (1/s)", fmt(stab.get("growth_rate"), 0))
+    c3.metric("Wall time (ms)", fmt(stab.get("wall_time"), 1, 1e3))
+    st.caption("Growth rate: how fast the plasma would drift up or down. Wall time: how long currents in the "
+               "vessel wall can slow it. Their product must be below 2 for a control system to keep up.")
+    if value is not None and value <= 0:
+        st.success("No growing vertical motion was found: this plasma is vertically stable on its own.")
+    elif value is not None and value < 2:
+        st.success("Below 2: a feedback control system can hold this plasma in place.")
+    elif value is not None:
+        st.warning("2 or more: the plasma would slip away too fast. Bring the vacuum vessel closer to the "
+                   "plasma; currents induced in the wall resist the plasma's motion.")
+
+
+def show_results(solved, stale):
+    st.divider()
+    st.header("Results")
+    if stale:
+        st.warning("Your design changed since the last solve. The results below are for the old design; "
+                   "press **Solve equilibrium** to update them.", icon=":material/history:")
+    res = solved["results"]
+    st.subheader("1. Did it converge?")
+    show_convergence(solved)
+    if solved["images"]:
+        st.subheader("2. Equilibrium" if "equilibrium" in solved["images"] else "2. Mesh")
+        show_equilibrium(solved["images"])
+    if res.get("stats"):
+        st.subheader("3. Equilibrium statistics")
+        show_stats(res, solved["design"])
+    if res.get("coil_currents"):
+        st.subheader("4. Coil currents")
+        show_coils(res)
+    if res.get("ok"):
+        st.subheader("5. Vertical stability")
+        show_stability(res)
+    if res.get("log"):
+        with st.expander("Solver log"):
+            st.code(res["log"])
+
+
+# ------------------------------------------------------------------ page
+st.set_page_config(page_title="Tokamak Designer", layout="wide")
+if "vv_base" not in st.session_state:
+    reset_design()
+vv_df, coil_df = controls()
+design = read_design(vv_df, coil_df)
+messages = validate_design(design)
+solved = st.session_state.get("solved")
+stale = solved is not None and solved["design"] != design
+
+st.title("Tokamak Designer")
+st.markdown(
+    "Design a tokamak and find its **equilibrium**: the state where the plasma's outward push is exactly "
+    "balanced by magnetic forces (the Grad–Shafranov equation, solved by TokaMaker).\n"
+    "1. **Shape**: set the target plasma shape in the sidebar.\n"
+    "2. **Build**: draw the vacuum vessel around it and place the 8 coils outside it. The picture updates live.\n"
+    "3. **Physics**: choose the field, plasma current, pressure and profile shapes.\n"
+    "4. **Solve and improve**: press *Solve equilibrium*, check the results against your device targets "
+    "(shape, q95, β_pol, l_i, coil currents below 2 × Ip, feedback parameter below 2), adjust, and solve again.")
+
+left, right = st.columns([3, 2])
+with left:
+    st.subheader("Cross-section")
+    lcfs = None if stale or solved is None else solved["results"].get("lcfs")
+    st.plotly_chart(cross_section(design, coil_df, flagged_objects(messages), lcfs), width="stretch")
+    st.caption("You are looking at a vertical slice through one side of the torus; the machine's central "
+               "axis is at R = 0, off to the left. Red objects have a problem (see the checks on the right).")
+with right:
+    st.subheader("Profile shapes")
+    st.plotly_chart(profile_figure(design), width="stretch")
+    st.subheader("Check and solve")
+    for m in messages:
+        (st.error if m["level"] == "error" else st.warning)(m["message"])
+    has_errors = any(m["level"] == "error" for m in messages)
+    if not messages:
+        st.success("Design checks passed. Ready to solve.")
+    if st.button("Solve equilibrium", type="primary", disabled=has_errors, width="stretch",
+                 help="Fix the errors above first." if has_errors else "Takes a few seconds."):
+        with st.spinner("TokaMaker is solving for the equilibrium. This takes a few seconds (longer if classmates are solving too)..."):
+            with solve_slots():
+                st.session_state.solved = run_solver(design)
         st.rerun()
-    
+
+if solved is not None:
+    show_results(solved, stale)
