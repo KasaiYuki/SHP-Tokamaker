@@ -67,7 +67,7 @@ def controls():
     """Draw every design control in the sidebar; return the edited vessel and coil tables."""
     s = st.session_state
     sb = st.sidebar
-    sb.header("Your tokamak design")
+    sb.header("Tokamak design parameters")
     sb.button("Reset to default values", on_click=reset_design, width="stretch")
 
     sb.subheader("1. Plasma shape targets")
@@ -428,10 +428,16 @@ def show_results(solved, stale):
 
 # ------------------------------------------------------------------ page
 st.set_page_config(page_title="Tokamaker Demo", layout="wide")
-# Streamlit leaves a tall blank band above the title; trim it so the cross-section fits on screen,
-# and lift the sidebar so its heading lines up with the page title.
-st.markdown("<style>.block-container {padding-top: 1.5rem;}"
-            '[data-testid="stSidebarUserContent"] {margin-top: -1.2rem;}</style>', unsafe_allow_html=True)
+# Trim Streamlit's blank band at the top of the page and sidebar so the cross-section fits on screen.
+# The top toolbar's Deploy button and menu are hidden so the title row can sit where they were, and the
+# sidebar is lifted so the bottom of its heading lines up with the bottom of the page title.
+st.html("""<style>
+.block-container {padding-top: 0.75rem;}
+[data-testid="stMain"] h1 {padding-top: 0; padding-bottom: 0.5rem;}
+[data-testid="stHeader"] {background: transparent;}
+[data-testid="stAppDeployButton"], [data-testid="stMainMenu"] {display: none;}
+[data-testid="stSidebarUserContent"] {margin-top: -2.8rem;}
+</style>""")
 if "vv_base" not in st.session_state:
     reset_design()
 vv_df, coil_df = controls()
@@ -442,7 +448,7 @@ stale = solved is not None and solved["design"] != design
 
 heading, logo = st.columns([12, 1], vertical_alignment="center")
 heading.title("Tokamaker Demo")
-logo.image(str(LOGO), width=80)
+logo.image(str(LOGO), width="stretch")  # a pixel width would make Streamlit shrink the file and blur it
 st.markdown(
     "Design a tokamak and find its **equilibrium**: the state where the plasma's outward push is exactly "
     "balanced by magnetic forces (the Grad–Shafranov equation, solved by TokaMaker).")
