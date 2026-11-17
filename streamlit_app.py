@@ -1,6 +1,6 @@
-"""Tokamaker Demo: a no-code version of the MAIN_AOE_tokamaker notebook.
+"""Tokamaker Demo: a no-code version of the AOE_tokamaker notebook.
 
-Students set the same quantities they would type into the notebook, watch their machine
+Users set the same quantities they would type into the notebook, watch their machine
 update live, and press "Solve equilibrium" to run TokaMaker. Each solve runs
 tokamak_solver.py in its own process, so OpenFUSIONToolkit is never imported here.
 
@@ -429,13 +429,13 @@ def show_results(solved, stale):
 # ------------------------------------------------------------------ page
 st.set_page_config(page_title="Tokamaker Demo", layout="wide")
 # Trim Streamlit's blank band at the top of the page and sidebar so the cross-section fits on screen.
-# The top toolbar's Deploy button and menu are hidden so the title row can sit where they were, and the
-# sidebar is lifted so the bottom of its heading lines up with the bottom of the page title.
+# The sidebar is lifted so the bottom of its heading lines up with the bottom of the page title.
+# The toolbar's buttons (Deploy, the menu, and the Share/star/edit/GitHub icons the hosting site adds) are hidden.
 st.html("""<style>
 .block-container {padding-top: 0.75rem;}
-[data-testid="stMain"] h1 {padding-top: 0; padding-bottom: 0.5rem;}
+[data-testid="stMain"] h1 {padding-top: 0.75rem; padding-bottom: 0.5rem;}
 [data-testid="stHeader"] {background: transparent;}
-[data-testid="stAppDeployButton"], [data-testid="stMainMenu"] {display: none;}
+[data-testid="stAppDeployButton"], [data-testid="stMainMenu"], [data-testid="stToolbarActions"] {display: none;}
 [data-testid="stSidebarUserContent"] {margin-top: -2.8rem;}
 </style>""")
 if "vv_base" not in st.session_state:
@@ -446,13 +446,14 @@ messages = validate_design(design)
 solved = st.session_state.get("solved")
 stale = solved is not None and solved["design"] != design
 
-heading, logo = st.columns([12, 1], vertical_alignment="center")
-heading.title("Tokamaker Demo")
+intro, logo = st.columns([12, 1])
+logo.html('<div style="height: 1.75rem"></div>')  # keeps the logo below the toolbar buttons (Share, menu, ...)
 logo.image(str(LOGO), width="stretch")  # a pixel width would make Streamlit shrink the file and blur it
-st.markdown(
+intro.title("Tokamaker Demo")
+intro.markdown(
     "Design a tokamak and find its **equilibrium**: the state where the plasma's outward push is exactly "
     "balanced by magnetic forces (the Grad–Shafranov equation, solved by TokaMaker).")
-with st.expander("How to use this page"):
+with intro.expander("How to use this page"):
     st.markdown(
         "1. **Shape**: set the target plasma shape in the sidebar.\n"
         "2. **Build**: choose the points that define the vacuum vessel that surrounds the plasma and place the PF coils outside it. The picture updates live.\n"
